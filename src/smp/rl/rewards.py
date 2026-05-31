@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from smp.pretrain.edm import EDMPrecond
 from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer
 
 if TYPE_CHECKING:
@@ -40,12 +41,16 @@ def smp_guidance_reward(
   ws: float = 4.0,
   normalize: bool = True,
 ) -> torch.Tensor:
-  """SDS-style guidance reward over fixed timesteps ``K``:
-  ``exp(-w_s/|K| · Σ_{i∈K} ‖ε̂_i − ε_i‖²)``.  ``normalize`` divides each MSE by a
-  ``DiffNormalizer`` running mean (policy-relative) vs. raw (absolute scale);
-  always stashes the mean raw MSE on ``env._smp_raw_err``."""
+  """SDS-style guidance reward ``exp(-w_s/|K| · Σ_{i∈K} ‖ε̂_i − ε_i‖²)``.
+
+  DDPM scores the ``‖ε̂ − ε‖²`` MSE at each integer timestep in
+  ``fixed_timesteps``; EDM scores the exact per-sample SDS residual
+  ``‖(x₀ − D)/σ‖²`` at each sigma in ``scorer.sds_sigmas`` (``fixed_timesteps``
+  is ignored). ``normalize`` divides each MSE by a ``DiffNormalizer`` running
+  mean (policy-relative) vs. raw (absolute scale); always stashes the mean raw
+  MSE on ``env._smp_raw_err``."""
   device = torch.device(env.device)
-  model, scheduler, q_low, q_high, _, _ = env._smp_bundle  # type: ignore[attr-defined]
+  model, scorer, q_low, q_high, _, _ = env._smp_bundle  # type: ignore[attr-defined]
   normalizer: DiffNormalizer = env._smp_normalizer  # type: ignore[attr-defined]
   buffer: MotionFeatureBuffer = env._smp_buffer  # type: ignore[attr-defined]
   _update_buffer_from_sim(env)
@@ -57,23 +62,35 @@ def smp_guidance_reward(
   total_err = torch.zeros(num_envs, device=device)
   total_raw = torch.zeros(num_envs, device=device)
   with torch.no_grad():
-    for t_scalar in fixed_timesteps:
-      if not 0 <= t_scalar < scheduler.num_timesteps:
-        msg = f"fixed_timestep {t_scalar} out of range [0, {scheduler.num_timesteps})"
-        raise ValueError(msg)
-      t = torch.full((num_envs,), t_scalar, dtype=torch.long, device=device)
-      noise = torch.randn_like(x_0)
-      x_t = scheduler.add_noise(x_0, noise, t)
-      eps_hat = model(x_t, t)
-      mse_per_env = ((eps_hat - noise) ** 2).mean(dim=(-1, -2))
-      total_raw += mse_per_env
-      if normalize:
-        total_err += normalizer.update_and_normalize(t_scalar, mse_per_env)
-      else:
-        total_err += mse_per_env
+    if isinstance(scorer, EDMPrecond):
+      # EDM: bucket index keys the normalizer (sized len(sds_sigmas)).
+      for bucket, sigma in enumerate(scorer.sds_sigmas):
+        mse_per_env = scorer.sds_err(model, x_0, sigma)
+        total_raw += mse_per_env
+        if normalize:
+          total_err += normalizer.update_and_normalize(bucket, mse_per_env)
+        else:
+          total_err += mse_per_env
+      n_terms = len(scorer.sds_sigmas)
+    else:
+      for t_scalar in fixed_timesteps:
+        if not 0 <= t_scalar < scorer.num_timesteps:
+          msg = f"fixed_timestep {t_scalar} out of range [0, {scorer.num_timesteps})"
+          raise ValueError(msg)
+        t = torch.full((num_envs,), t_scalar, dtype=torch.long, device=device)
+        noise = torch.randn_like(x_0)
+        x_t = scorer.add_noise(x_0, noise, t)
+        eps_hat = model(x_t, t)
+        mse_per_env = ((eps_hat - noise) ** 2).mean(dim=(-1, -2))
+        total_raw += mse_per_env
+        if normalize:
+          total_err += normalizer.update_and_normalize(t_scalar, mse_per_env)
+        else:
+          total_err += mse_per_env
+      n_terms = len(fixed_timesteps)
 
-  env._smp_raw_err = total_raw / len(fixed_timesteps)  # type: ignore[attr-defined]
-  err = total_err / len(fixed_timesteps)
+  env._smp_raw_err = total_raw / n_terms  # type: ignore[attr-defined]
+  err = total_err / n_terms
   return torch.exp(-err * ws)
 
 

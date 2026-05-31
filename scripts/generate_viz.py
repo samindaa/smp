@@ -24,6 +24,7 @@ import viser
 from mjlab.entity import Entity
 from mjlab.viewer.viser.scene import MjlabViserScene
 
+from smp.pretrain.edm import EDMPrecond, edm_precond_from_cfg
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 from smp.sampling.feature_to_state import (
@@ -55,9 +56,14 @@ def _resolve_ckpt_path(cfg: Cfg) -> str:
   return cfg.ckpt_path
 
 
-def _build_model_and_scheduler(
+def _build_model_and_sampler(
   ckpt: dict, device: torch.device
-) -> tuple[DiffusionDenoiser, DDPMScheduler, np.ndarray, np.ndarray]:
+) -> tuple[DiffusionDenoiser, DDPMScheduler | EDMPrecond, np.ndarray, np.ndarray]:
+  """Return (model, scheduler_or_precond, q_low, q_high).
+
+  The second element is a ``DDPMScheduler`` for DDPM checkpoints or an
+  ``EDMPrecond`` for EDM checkpoints; ``_run_generate`` branches on its type.
+  """
   cfg = ckpt["cfg"]
   model = DiffusionDenoiser(
     feature_dim=cfg["feature_dim"],
@@ -70,10 +76,11 @@ def _build_model_and_scheduler(
   state = ckpt.get("model_ema") or ckpt["model"]
   model.load_state_dict(state)
   model.eval()
-  scheduler = DDPMScheduler(
-    num_timesteps=cfg.get("num_timesteps", 50),
-  ).to(device)
-  return model, scheduler, ckpt["q_low"], ckpt["q_high"]
+  if cfg.get("model_family", "ddpm") == "edm":
+    sampler: DDPMScheduler | EDMPrecond = edm_precond_from_cfg(cfg)
+  else:
+    sampler = DDPMScheduler(num_timesteps=cfg.get("num_timesteps", 50)).to(device)
+  return model, sampler, ckpt["q_low"], ckpt["q_high"]
 
 
 def _setup_g1_sim(device: str):
@@ -102,22 +109,33 @@ def _quantile_denormalize(
 @torch.no_grad()
 def _run_generate(
   model: DiffusionDenoiser,
-  scheduler: DDPMScheduler,
+  sampler: DDPMScheduler | EDMPrecond,
   q_low: np.ndarray,
   q_high: np.ndarray,
   window_size: int,
   feature_dim: int,
   device: torch.device,
+  edm_steps: int,
 ) -> torch.Tensor:
-  """Unconditional DDPM ancestral sampling. Returns (W, F) denormalized window on CPU."""
-  x_t = torch.randn(1, window_size, feature_dim, device=device)
-  for t in reversed(range(scheduler.num_timesteps)):
-    t_batch = torch.full((1,), t, dtype=torch.long, device=device)
-    eps = model(x_t, t_batch)
-    x_t = scheduler.step(eps, x_t, t)
+  """Unconditional sampling. Returns (W, F) denormalized window on CPU.
+
+  EDM checkpoints use the Heun ODE sampler; DDPM checkpoints use ancestral
+  sampling.
+  """
+  if isinstance(sampler, EDMPrecond):
+    x_0 = sampler.heun_sample(
+      model, 1, window_size, feature_dim, edm_steps, device
+    ).squeeze(0)
+  else:
+    x_t = torch.randn(1, window_size, feature_dim, device=device)
+    for t in reversed(range(sampler.num_timesteps)):
+      t_batch = torch.full((1,), t, dtype=torch.long, device=device)
+      eps = model(x_t, t_batch)
+      x_t = sampler.step(eps, x_t, t)
+    x_0 = x_t.squeeze(0)
   q_low_t = torch.from_numpy(q_low).float().to(device)
   q_high_t = torch.from_numpy(q_high).float().to(device)
-  return _quantile_denormalize(x_t.squeeze(0), q_low_t, q_high_t).cpu()
+  return _quantile_denormalize(x_0, q_low_t, q_high_t).cpu()
 
 
 def _write_pose_to_robot(
@@ -145,11 +163,13 @@ def main(cfg: Cfg) -> None:
 
   ckpt_path = _resolve_ckpt_path(cfg)
   ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-  model, scheduler, q_low, q_high = _build_model_and_scheduler(ckpt, device)
-  print(f"Loaded checkpoint epoch={ckpt.get('epoch')} from {ckpt_path}")
+  model, sampler, q_low, q_high = _build_model_and_sampler(ckpt, device)
+  family = ckpt["cfg"].get("model_family", "ddpm")
+  print(f"Loaded checkpoint epoch={ckpt.get('epoch')} family={family} from {ckpt_path}")
 
   feature_dim = int(ckpt["cfg"]["feature_dim"])
   window_size = int(ckpt["cfg"]["window_size"])
+  edm_steps = int(ckpt["cfg"].get("edm_sample_steps", 18))
 
   sim_device = device_str
   sim, scene = _setup_g1_sim(sim_device)
@@ -163,12 +183,13 @@ def main(cfg: Cfg) -> None:
   def run() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     pred_denorm = _run_generate(
       model,
-      scheduler,
+      sampler,
       q_low,
       q_high,
       window_size,
       feature_dim,
       device,
+      edm_steps,
     )
     p_pos, p_quat, p_joint = window_to_pelvis_trajectory(
       pred_denorm,

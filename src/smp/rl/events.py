@@ -12,6 +12,7 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.utils.lab_api.math import quat_apply, quat_mul, yaw_quat
 
+from smp.pretrain.edm import EDMPrecond
 from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer, load_denoiser
 from smp.sampling.feature_to_state import (
   EE_BODY_NAMES,
@@ -21,6 +22,9 @@ from smp.sampling.feature_to_state import (
 )
 
 NUM_JOINTS = 29
+# Heun ODE steps for EDM prior sampling in GSI (more steps = closer to the
+# learned manifold; 18 is the EDM paper's default for this regime).
+GSI_HEUN_STEPS = 18
 
 
 def _maybe_compile(model, compile_model: bool, compile_mode: str | None):
@@ -62,13 +66,13 @@ def init_smp_state(
       "params={'ckpt_path': '/path/to/pretrained.pt'})."
     )
     raise RuntimeError(msg)
-  model, scheduler, q_low, q_high, feature_dim, window_size = load_denoiser(
+  model, scorer, q_low, q_high, feature_dim, window_size = load_denoiser(
     ckpt_path, env.device
   )
   model = _maybe_compile(model, compile_model, compile_mode)
   env._smp_bundle = (  # type: ignore[attr-defined]
     model,
-    scheduler,
+    scorer,
     q_low,
     q_high,
     feature_dim,
@@ -87,7 +91,12 @@ def init_smp_state(
     num_ee=NUM_EE,
     device=env.device,
   )
-  env._smp_normalizer = DiffNormalizer(scheduler.num_timesteps, env.device)  # type: ignore[attr-defined]
+  num_buckets = (
+    len(scorer.sds_sigmas)
+    if isinstance(scorer, EDMPrecond)
+    else scorer.num_timesteps
+  )
+  env._smp_normalizer = DiffNormalizer(num_buckets, env.device)  # type: ignore[attr-defined]
 
   if gsi_buffer_size <= 0:
     msg = f"gsi_buffer_size must be positive, got {gsi_buffer_size}."
@@ -95,15 +104,23 @@ def init_smp_state(
   pool_chunks: list[torch.Tensor] = []
   for start in range(0, gsi_buffer_size, gsi_batch_size):
     bsz = min(gsi_batch_size, gsi_buffer_size - start)
-    pool_chunks.append(_ddpm_sample(env, bsz))
+    pool_chunks.append(_sample_prior(env, bsz))
   env._smp_gsi_pool = torch.cat(pool_chunks, dim=0)  # type: ignore[attr-defined]
 
   if compile_model and env.num_envs != gsi_batch_size:
-    # Warm the reward-path shape so its Inductor compile happens here.
+    # Warm the reward-path shape so its Inductor compile happens here. Match
+    # the reward call exactly: EDM feeds a float c_noise via denoise(), DDPM
+    # feeds an integer timestep.
     with torch.no_grad():
       dummy_x = torch.randn(env.num_envs, window_size, feature_dim, device=env.device)
-      dummy_t = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-      _ = model(dummy_x, dummy_t)
+      if isinstance(scorer, EDMPrecond):
+        dummy_sigma = torch.full(
+          (env.num_envs,), scorer.sds_sigmas[0], device=env.device
+        )
+        _ = scorer.denoise(model, dummy_x, dummy_sigma)
+      else:
+        dummy_t = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        _ = model(dummy_x, dummy_t)
 
   gsi_reset(env)
 
@@ -188,15 +205,20 @@ def _prime_sim_and_buffer(
 
 
 @torch.no_grad()
-def _ddpm_sample(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
-  """Run DDPM ancestral sampling and return ``n`` denormalized windows."""
-  model, scheduler, q_low, q_high, feature_dim, window_size = env._smp_bundle  # type: ignore[attr-defined]
-  x_t = torch.randn(n, window_size, feature_dim, device=env.device)
-  for t_int in reversed(range(scheduler.num_timesteps)):
-    t = torch.full((n,), t_int, dtype=torch.long, device=env.device)
-    eps = model(x_t, t)
-    x_t = scheduler.step(eps, x_t, t_int)
-  return (x_t + 1.0) / 2.0 * (q_high - q_low) + q_low
+def _sample_prior(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
+  """Sample ``n`` denormalized windows from the prior (EDM Heun or DDPM)."""
+  model, scorer, q_low, q_high, feature_dim, window_size = env._smp_bundle  # type: ignore[attr-defined]
+  if isinstance(scorer, EDMPrecond):
+    x_0 = scorer.heun_sample(
+      model, n, window_size, feature_dim, GSI_HEUN_STEPS, env.device
+    )
+  else:
+    x_0 = torch.randn(n, window_size, feature_dim, device=env.device)
+    for t_int in reversed(range(scorer.num_timesteps)):
+      t = torch.full((n,), t_int, dtype=torch.long, device=env.device)
+      eps = model(x_0, t)
+      x_0 = scorer.step(eps, x_0, t_int)
+  return (x_0 + 1.0) / 2.0 * (q_high - q_low) + q_low
 
 
 @torch.no_grad()
@@ -219,7 +241,7 @@ def gsi_refresh(
     msg = f"num_samples ({num_samples}) cannot exceed pool size ({pool_size})"
     raise ValueError(msg)
 
-  new_windows = _ddpm_sample(env, num_samples)
+  new_windows = _sample_prior(env, num_samples)
   head = int(getattr(env, "_smp_gsi_head", 0))
   end = head + num_samples
   if end <= pool_size:

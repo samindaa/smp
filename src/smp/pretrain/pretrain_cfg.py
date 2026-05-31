@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from smp.utils import detect_device
 
@@ -16,6 +17,21 @@ class PretrainCfg:
   norm_stats_file: str = "datasets/norm_stats.npz"
   """Path to q01/q99 quantile stats from compute_norm_stats.py."""
   train_split: float = 0.9
+
+  # Diffusion formulation. "edm" (Karras preconditioning, continuous sigma) or
+  # "ddpm" (cosine-beta scheduler). Both share the DiffusionDenoiser DiT.
+  model_family: Literal["edm", "ddpm"] = "edm"
+  # EDM hyperparameters (used only when model_family == "edm"). sigma_data=0.5
+  # matches the std of the quantile-normalized (~[-1, 1]) features.
+  edm_sigma_data: float = 0.5
+  edm_sigma_min: float = 0.002
+  edm_sigma_max: float = 80.0
+  edm_rho: float = 7.0
+  edm_p_mean: float = -1.2
+  edm_p_std: float = 1.2
+  edm_time_emb_scale: float = 1000.0
+  edm_sample_steps: int = 18
+  """Heun steps for the periodic SDS sanity check / sampling."""
 
   # Model. ``d_model = nhead · head_dim`` is the DiT inner dim; FF inner
   # dim is fixed at 4·d_model.

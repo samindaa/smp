@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -13,10 +13,16 @@ import tyro
 from torch.utils.data import DataLoader, random_split
 
 from smp.pretrain.dataset import MotionWindowDataset
+from smp.pretrain.edm import EDMPrecond
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.pretrain_cfg import PretrainCfg
 from smp.pretrain.scheduler import DDPMScheduler
 from smp.utils import count_parameters, seed_everything
+
+if TYPE_CHECKING:
+  from collections.abc import Callable
+
+  LossFn = Callable[[torch.nn.Module, torch.Tensor], torch.Tensor]
 
 
 class _Ema:
@@ -65,6 +71,21 @@ def _diffusion_loss(
   noise = torch.randn_like(x_0_exp)
   x_t = scheduler.add_noise(x_0_exp, noise, t)
   return F.l1_loss(model(x_t, t), noise)
+
+
+@torch.no_grad()
+def _edm_sds_ratio(
+  precond: EDMPrecond, model: torch.nn.Module, x_0: torch.Tensor
+) -> float:
+  """Mean SDS error on real data / on matched noise, averaged over sds_sigmas.
+
+  A converged EDM prior puts much lower SDS error on real windows than on
+  noise, so this ratio (≪ 1 when good) is the readable health metric.
+  """
+  noise = torch.randn_like(x_0)
+  real = torch.stack([precond.sds_err(model, x_0, s) for s in precond.sds_sigmas])
+  rand = torch.stack([precond.sds_err(model, noise, s) for s in precond.sds_sigmas])
+  return (real.mean() / rand.mean().clamp(min=1e-9)).item()
 
 
 def _save_checkpoint(
@@ -132,10 +153,31 @@ def pretrain(cfg: PretrainCfg) -> Path:
     num_layers=cfg.num_layers,
     dropout=cfg.dropout,
   ).to(device)
-  scheduler = DDPMScheduler(
-    num_timesteps=cfg.num_timesteps,
-  ).to(device)
-  print(f"Denoiser: {count_parameters(model):,} params")
+  # Diffusion formulation: EDM (Karras precond) or DDPM. Both wrap the same
+  # DiffusionDenoiser, exposed through a shared loss_fn(model, x_0).
+  is_edm = cfg.model_family == "edm"
+  precond: EDMPrecond | None = None
+  if is_edm:
+    precond = EDMPrecond(
+      sigma_data=cfg.edm_sigma_data,
+      sigma_min=cfg.edm_sigma_min,
+      sigma_max=cfg.edm_sigma_max,
+      rho=cfg.edm_rho,
+      p_mean=cfg.edm_p_mean,
+      p_std=cfg.edm_p_std,
+      time_emb_scale=cfg.edm_time_emb_scale,
+    )
+
+    def loss_fn(m: torch.nn.Module, x_0: torch.Tensor) -> torch.Tensor:
+      assert precond is not None
+      return precond.edm_loss(m, x_0, cfg.num_noise_samples)
+  else:
+    scheduler = DDPMScheduler(num_timesteps=cfg.num_timesteps).to(device)
+
+    def loss_fn(m: torch.nn.Module, x_0: torch.Tensor) -> torch.Tensor:
+      return _diffusion_loss(m, scheduler, x_0, cfg.num_noise_samples)
+
+  print(f"Denoiser: {count_parameters(model):,} params | family={cfg.model_family}")
 
   optimizer = torch.optim.AdamW(
     model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
@@ -169,7 +211,7 @@ def pretrain(cfg: PretrainCfg) -> Path:
 
     for batch in train_loader:
       x_0 = batch.to(device, non_blocking=pin_memory)
-      loss = _diffusion_loss(model, scheduler, x_0, cfg.num_noise_samples)
+      loss = loss_fn(model, x_0)
 
       optimizer.zero_grad()
       loss.backward()
@@ -186,15 +228,23 @@ def pretrain(cfg: PretrainCfg) -> Path:
 
     if epoch % cfg.log_interval == 0:
       eval_model = ema.shadow if ema is not None else model
-      val_loss = _validate(
-        eval_model, scheduler, val_loader, device, pin_memory, cfg.num_noise_samples
-      )
-      print(f"Epoch {epoch:4d} | train={avg_loss:.6f} | val={val_loss:.6f}")
+      val_loss = _validate(eval_model, val_loader, device, pin_memory, loss_fn)
+      sds_ratio = None
+      if precond is not None:
+        val_batch = next(iter(val_loader)).to(device, non_blocking=pin_memory)
+        sds_ratio = _edm_sds_ratio(precond, eval_model, val_batch)
+      ratio_str = f" | sds_ratio={sds_ratio:.4f}" if sds_ratio is not None else ""
+      print(f"Epoch {epoch:4d} | train={avg_loss:.6f} | val={val_loss:.6f}{ratio_str}")
       if writer is not None:
         writer.add_scalar("train/loss", avg_loss, epoch)
         writer.add_scalar("val/loss", val_loss, epoch)
+        if sds_ratio is not None:
+          writer.add_scalar("val/sds_ratio", sds_ratio, epoch)
       if wandb_run is not None:
-        wandb_run.log({"epoch": epoch, "train/loss": avg_loss, "val/loss": val_loss})
+        log = {"epoch": epoch, "train/loss": avg_loss, "val/loss": val_loss}
+        if sds_ratio is not None:
+          log["val/sds_ratio"] = sds_ratio
+        wandb_run.log(log)
 
     if epoch % cfg.save_interval == 0 or epoch == cfg.num_epochs - 1:
       ckpt_path = save_dir / f"checkpoint_{epoch:05d}.pt"
@@ -223,18 +273,17 @@ def pretrain(cfg: PretrainCfg) -> Path:
 @torch.no_grad()
 def _validate(
   model: torch.nn.Module | DiffusionDenoiser,
-  scheduler: DDPMScheduler,
   val_loader: DataLoader[torch.Tensor],
   device: torch.device,
   pin_memory: bool,
-  num_noise_samples: int,
+  loss_fn: LossFn,
 ) -> float:
   model.eval()
   total = torch.zeros((), device=device)
   n = 0
   for batch in val_loader:
     x_0 = batch.to(device, non_blocking=pin_memory)
-    total += _diffusion_loss(model, scheduler, x_0, num_noise_samples)
+    total += loss_fn(model, x_0)
     n += 1
   return (total / max(n, 1)).item()
 

@@ -14,6 +14,7 @@ from mjlab.utils.lab_api.math import (
   yaw_quat,
 )
 
+from smp.pretrain.edm import EDMPrecond, edm_precond_from_cfg
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 
@@ -21,9 +22,16 @@ from smp.pretrain.scheduler import DDPMScheduler
 def load_denoiser(
   ckpt_path: str,
   device: torch.device | str,
-) -> tuple[DiffusionDenoiser, DDPMScheduler, torch.Tensor, torch.Tensor, int, int]:
-  """Load a frozen pretrained denoiser checkpoint → ``(model, scheduler, q_low,
-  q_high, feature_dim, window_size)``."""
+) -> tuple[
+  DiffusionDenoiser, DDPMScheduler | EDMPrecond, torch.Tensor, torch.Tensor, int, int
+]:
+  """Load a frozen pretrained denoiser checkpoint → ``(model, scorer, q_low,
+  q_high, feature_dim, window_size)``.
+
+  ``scorer`` is a ``DDPMScheduler`` for DDPM checkpoints or an ``EDMPrecond``
+  for EDM checkpoints (``cfg["model_family"] == "edm"``); the reward and GSI
+  paths branch on its type.
+  """
   device = torch.device(device)
 
   ckpt: dict[str, Any] = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -44,14 +52,16 @@ def load_denoiser(
   model.eval()
   model.requires_grad_(False)
 
-  scheduler = DDPMScheduler(
-    num_timesteps=int(cfg.get("num_timesteps", 50)),
-  ).to(device)
+  scorer: DDPMScheduler | EDMPrecond
+  if cfg.get("model_family", "ddpm") == "edm":
+    scorer = edm_precond_from_cfg(cfg)
+  else:
+    scorer = DDPMScheduler(num_timesteps=int(cfg.get("num_timesteps", 50))).to(device)
 
   q_low = torch.from_numpy(np.asarray(ckpt["q_low"], dtype=np.float32)).to(device)
   q_high = torch.from_numpy(np.asarray(ckpt["q_high"], dtype=np.float32)).to(device)
 
-  return model, scheduler, q_low, q_high, feature_dim, window_size
+  return model, scorer, q_low, q_high, feature_dim, window_size
 
 
 class DiffNormalizer:

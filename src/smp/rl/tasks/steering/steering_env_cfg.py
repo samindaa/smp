@@ -60,7 +60,7 @@ def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "logs/pretrain/g1_locomotion/20260531_105634/pretrained.pt"
+    "logs/pretrain/g1_locomotion_edm/20260531_141329/pretrained.pt"
   )
 
   # --- Terminations --------------------------------------------------------
