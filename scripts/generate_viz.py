@@ -37,9 +37,7 @@ from smp.utils import detect_device
 @dataclass
 class Cfg:
   ckpt_path: str = ""
-  """Path to a local SMP diffusion checkpoint .pt file. Mutually exclusive with --wandb-run."""
-  wandb_run: str = ""
-  """W&B run path '<entity>/<project>/<run_id>'. Downloads the latest .pt from the run."""
+  """Path to a local SMP diffusion checkpoint .pt file."""
   device: str = ""
   """Compute device. Empty = auto."""
   fps: float = 50.0
@@ -47,31 +45,14 @@ class Cfg:
 
 
 def _resolve_ckpt_path(cfg: Cfg) -> str:
-  """Return a local ckpt path, downloading from wandb if --wandb-run is set."""
-  if bool(cfg.ckpt_path) == bool(cfg.wandb_run):
-    msg = "Specify exactly one of --ckpt-path or --wandb-run"
+  """Validate and return the local checkpoint path."""
+  if not cfg.ckpt_path:
+    msg = "Specify --ckpt-path pointing to a local checkpoint .pt file"
     raise ValueError(msg)
-  if cfg.ckpt_path:
-    return cfg.ckpt_path
-
-  import wandb
-
-  api = wandb.Api()
-  run = api.run(cfg.wandb_run)
-  pt_files = [f for f in run.files() if f.name.endswith(".pt")]
-  if not pt_files:
-    msg = f"No .pt files in wandb run {cfg.wandb_run}"
+  if not Path(cfg.ckpt_path).is_file():
+    msg = f"Checkpoint not found: {cfg.ckpt_path}"
     raise FileNotFoundError(msg)
-  target = next(
-    (f for f in pt_files if Path(f.name).name == "pretrained.pt"),
-    sorted(pt_files, key=lambda f: f.name)[-1],
-  )
-  download_dir = Path("logs") / "wandb_ckpt_cache" / cfg.wandb_run.replace("/", "_")
-  download_dir.mkdir(parents=True, exist_ok=True)
-  target.download(root=str(download_dir), replace=True)
-  local = download_dir / target.name
-  print(f"Downloaded {target.name} from {cfg.wandb_run} -> {local}")
-  return str(local)
+  return cfg.ckpt_path
 
 
 def _build_model_and_scheduler(

@@ -58,7 +58,7 @@ def g1_forward_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # --- Events --------------------------------------------------------------
   cfg.events["init_smp_state"].params["ckpt_path"] = (
-    "datasets/pretrain_ckpt/pretrained_loco.pt"
+    "logs/pretrain/g1_locomotion/20260531_105634/pretrained.pt"
   )
 
   # --- Terminations --------------------------------------------------------

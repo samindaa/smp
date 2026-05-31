@@ -41,5 +41,5 @@ def unitree_g1_smp_ppo_runner_cfg():
     save_interval=500,
     num_steps_per_env=24,
     max_iterations=30_000,
-    wandb_project="smp",
+    logger="tensorboard",
   )

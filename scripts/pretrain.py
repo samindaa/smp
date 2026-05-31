@@ -149,6 +149,13 @@ def pretrain(cfg: PretrainCfg) -> Path:
   save_dir = Path(cfg.log_dir) / cfg.name / timestamp
   save_dir.mkdir(parents=True, exist_ok=True)
 
+  writer = None
+  if cfg.use_tensorboard:
+    from torch.utils.tensorboard.writer import SummaryWriter
+
+    writer = SummaryWriter(log_dir=str(save_dir))
+    print(f"TensorBoard logging to {save_dir}")
+
   wandb_run = None
   if cfg.use_wandb:
     import wandb
@@ -183,6 +190,9 @@ def pretrain(cfg: PretrainCfg) -> Path:
         eval_model, scheduler, val_loader, device, pin_memory, cfg.num_noise_samples
       )
       print(f"Epoch {epoch:4d} | train={avg_loss:.6f} | val={val_loss:.6f}")
+      if writer is not None:
+        writer.add_scalar("train/loss", avg_loss, epoch)
+        writer.add_scalar("val/loss", val_loss, epoch)
       if wandb_run is not None:
         wandb_run.log({"epoch": epoch, "train/loss": avg_loss, "val/loss": val_loss})
 
@@ -203,6 +213,9 @@ def pretrain(cfg: PretrainCfg) -> Path:
   if wandb_run is not None:
     wandb_run.save(str(final_path), base_path=str(save_dir))
     wandb_run.finish()
+
+  if writer is not None:
+    writer.close()
 
   return final_path
 

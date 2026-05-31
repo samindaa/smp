@@ -14,6 +14,9 @@ dependencies = [
   "numpy>=1.26",
   "matplotlib>=3.9",
   "wandb>=0.19",
+  "tensorboard>=2.20",
+  # tensorboard imports pkg_resources, which setuptools dropped in 81+.
+  "setuptools<81",
   "tyro>=0.9",
   "scikit-learn>=1.6",
 ]

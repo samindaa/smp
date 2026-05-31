@@ -46,8 +46,10 @@ class PretrainCfg:
   log_interval: int = 10
   save_interval: int = 100
   log_dir: str = "logs/pretrain"
+  use_tensorboard: bool = True
+  """Write scalars to TensorBoard under the run's save dir."""
   wandb_project: str = "smp"
-  use_wandb: bool = True
+  use_wandb: bool = False
 
   # Device
   device: str = ""
