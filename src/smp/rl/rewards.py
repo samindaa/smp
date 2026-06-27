@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from smp.pretrain.edm import EDMPrecond
+from smp.pretrain.flow import FMPrecond
 from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer
 
 if TYPE_CHECKING:
@@ -45,8 +46,9 @@ def smp_guidance_reward(
 
   DDPM scores the ``‖ε̂ − ε‖²`` MSE at each integer timestep in
   ``fixed_timesteps``; EDM scores the exact per-sample SDS residual
-  ``‖(x₀ − D)/σ‖²`` at each sigma in ``scorer.sds_sigmas`` (``fixed_timesteps``
-  is ignored). ``normalize`` divides each MSE by a ``DiffNormalizer`` running
+  ``‖(x₀ − D)/σ‖²`` and flow matching the velocity residual
+  ``‖v_θ(x_τ,τ) − (x_data − z)‖²``, each at the scalar levels in
+  ``scorer.sds_sigmas`` (``fixed_timesteps`` is ignored). ``normalize`` divides each MSE by a ``DiffNormalizer`` running
   mean (policy-relative) vs. raw (absolute scale); always stashes the mean raw
   MSE on ``env._smp_raw_err``."""
   device = torch.device(env.device)
@@ -62,8 +64,8 @@ def smp_guidance_reward(
   total_err = torch.zeros(num_envs, device=device)
   total_raw = torch.zeros(num_envs, device=device)
   with torch.no_grad():
-    if isinstance(scorer, EDMPrecond):
-      # EDM: bucket index keys the normalizer (sized len(sds_sigmas)).
+    if isinstance(scorer, (EDMPrecond, FMPrecond)):
+      # EDM / flow: bucket index keys the normalizer (sized len(sds_sigmas)).
       for bucket, sigma in enumerate(scorer.sds_sigmas):
         mse_per_env = scorer.sds_err(model, x_0, sigma)
         total_raw += mse_per_env

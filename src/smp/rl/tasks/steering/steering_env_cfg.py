@@ -18,8 +18,16 @@ from smp.rl.rewards import task_smp_product
 from smp.rl.tasks.steering import mdp
 
 
-def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Build the G1 steering env cfg with SMP guidance."""
+def g1_steering_smp_env_cfg(
+  play: bool = False, prior_ckpt: str | None = None
+) -> ManagerBasedRlEnvCfg:
+  """Build the G1 steering env cfg with SMP guidance.
+
+  ``prior_ckpt`` overrides the motion-prior checkpoint driving the SMP guidance
+  reward. It accepts EDM, DDPM, or flow-matching priors interchangeably (the
+  reward path branches on the loaded scorer type); defaults to the shipped EDM
+  locomotion prior.
+  """
   cfg = g1_smp_env_cfg(play=play)
 
   # --- Commands ------------------------------------------------------------
@@ -59,7 +67,7 @@ def g1_steering_smp_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
 
   # --- Events --------------------------------------------------------------
-  cfg.events["init_smp_state"].params["ckpt_path"] = (
+  cfg.events["init_smp_state"].params["ckpt_path"] = prior_ckpt or (
     "logs/pretrain/g1_locomotion_edm/20260531_141329/pretrained.pt"
   )
 

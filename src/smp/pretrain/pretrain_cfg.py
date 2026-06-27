@@ -18,9 +18,10 @@ class PretrainCfg:
   """Path to q01/q99 quantile stats from compute_norm_stats.py."""
   train_split: float = 0.9
 
-  # Diffusion formulation. "edm" (Karras preconditioning, continuous sigma) or
-  # "ddpm" (cosine-beta scheduler). Both share the DiffusionDenoiser DiT.
-  model_family: Literal["edm", "ddpm"] = "edm"
+  # Generative formulation. "edm" (Karras preconditioning, continuous sigma),
+  # "ddpm" (cosine-beta scheduler), or "flow" (conditional/rectified flow
+  # matching). All three share the DiffusionDenoiser DiT backbone.
+  model_family: Literal["edm", "ddpm", "flow"] = "edm"
   # EDM hyperparameters (used only when model_family == "edm"). sigma_data=0.5
   # matches the std of the quantile-normalized (~[-1, 1]) features.
   edm_sigma_data: float = 0.5
@@ -32,6 +33,16 @@ class PretrainCfg:
   edm_time_emb_scale: float = 1000.0
   edm_sample_steps: int = 18
   """Heun steps for the periodic SDS sanity check / sampling."""
+
+  # Flow-matching hyperparameters (used only when model_family == "flow").
+  fm_time_emb_scale: float = 1000.0
+  fm_time_sampling: Literal["logitnormal", "uniform"] = "logitnormal"
+  fm_logitnorm_mu: float = 0.0
+  fm_logitnorm_sigma: float = 1.0
+  fm_times: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
+  """Fixed flow times tau in (0,1) for the SDS-style guidance reward."""
+  fm_sample_steps: int = 8
+  """Heun steps for the periodic health check / sampling."""
 
   # Model. ``d_model = nhead · head_dim`` is the DiT inner dim; FF inner
   # dim is fixed at 4·d_model.

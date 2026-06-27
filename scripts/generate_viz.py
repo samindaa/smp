@@ -25,6 +25,7 @@ from mjlab.entity import Entity
 from mjlab.viewer.viser.scene import MjlabViserScene
 
 from smp.pretrain.edm import EDMPrecond, edm_precond_from_cfg
+from smp.pretrain.flow import FMPrecond, fm_precond_from_cfg
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 from smp.sampling.feature_to_state import (
@@ -58,11 +59,13 @@ def _resolve_ckpt_path(cfg: Cfg) -> str:
 
 def _build_model_and_sampler(
   ckpt: dict, device: torch.device
-) -> tuple[DiffusionDenoiser, DDPMScheduler | EDMPrecond, np.ndarray, np.ndarray]:
+) -> tuple[
+  DiffusionDenoiser, DDPMScheduler | EDMPrecond | FMPrecond, np.ndarray, np.ndarray
+]:
   """Return (model, scheduler_or_precond, q_low, q_high).
 
-  The second element is a ``DDPMScheduler`` for DDPM checkpoints or an
-  ``EDMPrecond`` for EDM checkpoints; ``_run_generate`` branches on its type.
+  The second element is a ``DDPMScheduler`` (DDPM), ``EDMPrecond`` (EDM) or
+  ``FMPrecond`` (flow); ``_run_generate`` branches on its type.
   """
   cfg = ckpt["cfg"]
   model = DiffusionDenoiser(
@@ -76,8 +79,11 @@ def _build_model_and_sampler(
   state = ckpt.get("model_ema") or ckpt["model"]
   model.load_state_dict(state)
   model.eval()
-  if cfg.get("model_family", "ddpm") == "edm":
-    sampler: DDPMScheduler | EDMPrecond = edm_precond_from_cfg(cfg)
+  family = cfg.get("model_family", "ddpm")
+  if family == "edm":
+    sampler: DDPMScheduler | EDMPrecond | FMPrecond = edm_precond_from_cfg(cfg)
+  elif family == "flow":
+    sampler = fm_precond_from_cfg(cfg)
   else:
     sampler = DDPMScheduler(num_timesteps=cfg.get("num_timesteps", 50)).to(device)
   return model, sampler, ckpt["q_low"], ckpt["q_high"]
@@ -109,7 +115,7 @@ def _quantile_denormalize(
 @torch.no_grad()
 def _run_generate(
   model: DiffusionDenoiser,
-  sampler: DDPMScheduler | EDMPrecond,
+  sampler: DDPMScheduler | EDMPrecond | FMPrecond,
   q_low: np.ndarray,
   q_high: np.ndarray,
   window_size: int,
@@ -119,10 +125,10 @@ def _run_generate(
 ) -> torch.Tensor:
   """Unconditional sampling. Returns (W, F) denormalized window on CPU.
 
-  EDM checkpoints use the Heun ODE sampler; DDPM checkpoints use ancestral
-  sampling.
+  EDM and flow checkpoints use the Heun ODE sampler; DDPM checkpoints use
+  ancestral sampling.
   """
-  if isinstance(sampler, EDMPrecond):
+  if isinstance(sampler, (EDMPrecond, FMPrecond)):
     x_0 = sampler.heun_sample(
       model, 1, window_size, feature_dim, edm_steps, device
     ).squeeze(0)
@@ -169,7 +175,11 @@ def main(cfg: Cfg) -> None:
 
   feature_dim = int(ckpt["cfg"]["feature_dim"])
   window_size = int(ckpt["cfg"]["window_size"])
-  edm_steps = int(ckpt["cfg"].get("edm_sample_steps", 18))
+  # ODE step count for the Heun sampler (EDM / flow); ignored by DDPM.
+  if family == "flow":
+    edm_steps = int(ckpt["cfg"].get("fm_sample_steps", 8))
+  else:
+    edm_steps = int(ckpt["cfg"].get("edm_sample_steps", 18))
 
   sim_device = device_str
   sim, scene = _setup_g1_sim(sim_device)

@@ -13,6 +13,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.utils.lab_api.math import quat_apply, quat_mul, yaw_quat
 
 from smp.pretrain.edm import EDMPrecond
+from smp.pretrain.flow import FMPrecond
 from smp.rl.utils import DiffNormalizer, MotionFeatureBuffer, load_denoiser
 from smp.sampling.feature_to_state import (
   EE_BODY_NAMES,
@@ -93,7 +94,7 @@ def init_smp_state(
   )
   num_buckets = (
     len(scorer.sds_sigmas)
-    if isinstance(scorer, EDMPrecond)
+    if isinstance(scorer, (EDMPrecond, FMPrecond))
     else scorer.num_timesteps
   )
   env._smp_normalizer = DiffNormalizer(num_buckets, env.device)  # type: ignore[attr-defined]
@@ -113,7 +114,7 @@ def init_smp_state(
     # feeds an integer timestep.
     with torch.no_grad():
       dummy_x = torch.randn(env.num_envs, window_size, feature_dim, device=env.device)
-      if isinstance(scorer, EDMPrecond):
+      if isinstance(scorer, (EDMPrecond, FMPrecond)):
         dummy_sigma = torch.full(
           (env.num_envs,), scorer.sds_sigmas[0], device=env.device
         )
@@ -208,7 +209,7 @@ def _prime_sim_and_buffer(
 def _sample_prior(env: ManagerBasedRlEnv, n: int) -> torch.Tensor:
   """Sample ``n`` denormalized windows from the prior (EDM Heun or DDPM)."""
   model, scorer, q_low, q_high, feature_dim, window_size = env._smp_bundle  # type: ignore[attr-defined]
-  if isinstance(scorer, EDMPrecond):
+  if isinstance(scorer, (EDMPrecond, FMPrecond)):
     x_0 = scorer.heun_sample(
       model, n, window_size, feature_dim, GSI_HEUN_STEPS, env.device
     )

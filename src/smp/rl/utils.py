@@ -15,6 +15,7 @@ from mjlab.utils.lab_api.math import (
 )
 
 from smp.pretrain.edm import EDMPrecond, edm_precond_from_cfg
+from smp.pretrain.flow import FMPrecond, fm_precond_from_cfg
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.scheduler import DDPMScheduler
 
@@ -23,14 +24,19 @@ def load_denoiser(
   ckpt_path: str,
   device: torch.device | str,
 ) -> tuple[
-  DiffusionDenoiser, DDPMScheduler | EDMPrecond, torch.Tensor, torch.Tensor, int, int
+  DiffusionDenoiser,
+  DDPMScheduler | EDMPrecond | FMPrecond,
+  torch.Tensor,
+  torch.Tensor,
+  int,
+  int,
 ]:
   """Load a frozen pretrained denoiser checkpoint → ``(model, scorer, q_low,
   q_high, feature_dim, window_size)``.
 
-  ``scorer`` is a ``DDPMScheduler`` for DDPM checkpoints or an ``EDMPrecond``
-  for EDM checkpoints (``cfg["model_family"] == "edm"``); the reward and GSI
-  paths branch on its type.
+  ``scorer`` is a ``DDPMScheduler`` for DDPM checkpoints, an ``EDMPrecond`` for
+  EDM checkpoints, or an ``FMPrecond`` for flow-matching checkpoints (keyed by
+  ``cfg["model_family"]``); the reward and GSI paths branch on its type.
   """
   device = torch.device(device)
 
@@ -52,9 +58,12 @@ def load_denoiser(
   model.eval()
   model.requires_grad_(False)
 
-  scorer: DDPMScheduler | EDMPrecond
-  if cfg.get("model_family", "ddpm") == "edm":
+  scorer: DDPMScheduler | EDMPrecond | FMPrecond
+  family = cfg.get("model_family", "ddpm")
+  if family == "edm":
     scorer = edm_precond_from_cfg(cfg)
+  elif family == "flow":
+    scorer = fm_precond_from_cfg(cfg)
   else:
     scorer = DDPMScheduler(num_timesteps=int(cfg.get("num_timesteps", 50))).to(device)
 

@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, random_split
 
 from smp.pretrain.dataset import MotionWindowDataset
 from smp.pretrain.edm import EDMPrecond
+from smp.pretrain.flow import FMPrecond
 from smp.pretrain.model import DiffusionDenoiser
 from smp.pretrain.pretrain_cfg import PretrainCfg
 from smp.pretrain.scheduler import DDPMScheduler
@@ -75,12 +76,14 @@ def _diffusion_loss(
 
 @torch.no_grad()
 def _edm_sds_ratio(
-  precond: EDMPrecond, model: torch.nn.Module, x_0: torch.Tensor
+  precond: EDMPrecond | FMPrecond, model: torch.nn.Module, x_0: torch.Tensor
 ) -> float:
   """Mean SDS error on real data / on matched noise, averaged over sds_sigmas.
 
-  A converged EDM prior puts much lower SDS error on real windows than on
-  noise, so this ratio (≪ 1 when good) is the readable health metric.
+  A converged EDM / flow prior puts much lower SDS (residual) error on real
+  windows than on noise, so this ratio (≪ 1 when good) is the readable health
+  metric. ``FMPrecond`` exposes the same ``sds_err`` / ``sds_sigmas`` surface, so
+  this works unchanged for flow models.
   """
   noise = torch.randn_like(x_0)
   real = torch.stack([precond.sds_err(model, x_0, s) for s in precond.sds_sigmas])
@@ -153,11 +156,11 @@ def pretrain(cfg: PretrainCfg) -> Path:
     num_layers=cfg.num_layers,
     dropout=cfg.dropout,
   ).to(device)
-  # Diffusion formulation: EDM (Karras precond) or DDPM. Both wrap the same
-  # DiffusionDenoiser, exposed through a shared loss_fn(model, x_0).
-  is_edm = cfg.model_family == "edm"
-  precond: EDMPrecond | None = None
-  if is_edm:
+  # Generative formulation: EDM (Karras precond), flow matching, or DDPM. All
+  # wrap the same DiffusionDenoiser, exposed through a shared loss_fn(model, x_0).
+  # ``precond`` (EDM or flow) also drives the SDS-ratio health metric.
+  precond: EDMPrecond | FMPrecond | None = None
+  if cfg.model_family == "edm":
     precond = EDMPrecond(
       sigma_data=cfg.edm_sigma_data,
       sigma_min=cfg.edm_sigma_min,
@@ -171,6 +174,18 @@ def pretrain(cfg: PretrainCfg) -> Path:
     def loss_fn(m: torch.nn.Module, x_0: torch.Tensor) -> torch.Tensor:
       assert precond is not None
       return precond.edm_loss(m, x_0, cfg.num_noise_samples)
+  elif cfg.model_family == "flow":
+    precond = FMPrecond(
+      time_emb_scale=cfg.fm_time_emb_scale,
+      time_sampling=cfg.fm_time_sampling,
+      logitnorm_mu=cfg.fm_logitnorm_mu,
+      logitnorm_sigma=cfg.fm_logitnorm_sigma,
+      sds_sigmas=tuple(cfg.fm_times),
+    )
+
+    def loss_fn(m: torch.nn.Module, x_0: torch.Tensor) -> torch.Tensor:
+      assert precond is not None
+      return precond.fm_loss(m, x_0, cfg.num_noise_samples)
   else:
     scheduler = DDPMScheduler(num_timesteps=cfg.num_timesteps).to(device)
 
